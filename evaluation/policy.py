@@ -6,6 +6,7 @@ import os
 import pickle
 import numpy as np
 import tensorflow as tf
+import ipdb
 
 import tb_logger as logger
 from phi_functions.ContinousMLPPhiFunction import ContinousMLPPhiFunction
@@ -44,6 +45,13 @@ class Policy(object):
         self.phi = ContinousMLPPhiFunction(obs_dim, act_dim, 
                     hidden_sizes=phi_hidden_sizes, regular_scale=reg_scale)
         
+
+        # Create an action independent baseline
+        self.phi_action_indep = ContinousMLPPhiFunction(obs_dim,
+                                                        act_dim,
+                                                        hidden_sizes=phi_hidden_sizes,
+                                                        regular_scale=reg_scale)
+
         self.lr_phi = lr_phi
 
         self._build_graph()
@@ -270,7 +278,23 @@ class Policy(object):
         self.train_op = optimizer.minimize(self.loss, 
                         var_list= self.policy_nn_vars)
 
-        
+
+        # Create the inner terms w/ the action independent baseline
+        phi_ai_value, _ = self.phi_action_indep(self.obs_ph,
+                                                tf.stop_gradient(self.means),
+                                                reuse=False)
+        phi_ai_nn_vars = self.phi_action_indep.phi_vars
+        phi_ai_value.set_shape((None,))
+
+        log_vars_inner_ai = tf.expand_dims(tf.exp(self.logp - self.logp_old), 1) \
+                        * (ll_log_vars_g * tf.expand_dims(self.advantages_ph
+                        - self.c_ph * phi_ai_value, 1))
+
+        means_inner_ai = tf.expand_dims(tf.exp(self.logp - self.logp_old), 1) \
+            * (ll_mean_g * tf.expand_dims(self.advantages_ph -
+                                          self.c_ph * phi_ai_value, 1))
+
+
         # phi loss train op
         if self.phi_obj == 'MinVar':
             means_mse = tf.reduce_sum(\
@@ -284,7 +308,7 @@ class Policy(object):
                     tf.square(log_vars_inner - \
                     tf.reduce_mean(log_vars_inner,\
                     axis=0)), axis = 0))
-                        
+
             gradient = tf.concat([means_inner, log_vars_inner], axis=1)
 
             est_A = tf.gather(gradient, tf.range(0, tf.shape(gradient)[0] //2))
@@ -292,13 +316,25 @@ class Policy(object):
             est_B = tf.gather(gradient, 
                     tf.range(tf.shape(gradient)[0] //2, 
                     tf.shape(gradient)[0]))
-            
+
             # calculate loss
             est_var = tf.reduce_sum(\
                     tf.square(tf.reduce_mean(\
                     est_A, axis=0) - \
                     tf.reduce_mean(est_B, axis=0)))
-        
+
+            # Action independent min var loss
+            means_ai_mse = tf.reduce_sum(\
+                    tf.reduce_mean( \
+                    tf.square(means_inner_ai - \
+                    tf.reduce_mean(means_inner_ai, \
+                    axis=0)), axis = 0))
+
+            logstd_vars_ai_mse = tf.reduce_sum(\
+                    tf.reduce_mean(\
+                    tf.square(log_vars_inner_ai - \
+                    tf.reduce_mean(log_vars_inner_ai,\
+                    axis=0)), axis = 0))
         
         if self.reg_scale > 0.:
             reg_variables = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
@@ -317,11 +353,16 @@ class Policy(object):
             
             logger.log('phi_with FitQ as objective function')
 
+            # Set up loss for action independent baseline
+            self.phi_ai_loss = tf.reduce_mean(
+                tf.square(self.advantages_ph - phi_ai_value), axis=0) + reg_term
+
         elif self.phi_obj == 'MinVar':
             
             self.phi_loss = means_mse + logstd_vars_mse + reg_term
             logger.log('phi with MinVar as objecive function')
-        
+
+            self.phi_ai_loss = means_ai_mse + logstd_vars_ai_mse + reg_term
         else:
             raise NotImplementedError
         
@@ -329,8 +370,14 @@ class Policy(object):
         phi_optimizer = tf.train.AdamOptimizer(self.lr_phi_ph)      
         self.phi_train_op = phi_optimizer.minimize(self.phi_loss, var_list=self.phi_nn_vars)
 
+        phi_ai_optimizer = tf.train.AdamOptimizer(self.lr_phi_ph)
+        self.phi_ai_train_op = phi_ai_optimizer.minimize(self.phi_ai_loss, var_list=phi_ai_nn_vars)
+
         self.means_inner = means_inner
         self.log_vars_inner = log_vars_inner
+
+        self.means_inner_ai = means_inner_ai
+        self.log_vars_inner_ai = log_vars_inner_ai
 
     def get_batch_gradient(self, observes, actions, advantages, c):
         feed_dict = {self.obs_ph: observes,
@@ -346,14 +393,21 @@ class Policy(object):
         feed_dict[self.old_log_vars_ph] = old_log_vars_np
         feed_dict[self.old_means_ph] = old_means_np
         
-        means_gradient, vars_gradient, phi_loss = self.sess.run(
+        means_gradient, vars_gradient, phi_loss, means_ai_gradient, vars_ai_gradient, phi_ai_loss = self.sess.run(
                         [self.means_inner, 
-                        self.log_vars_inner, self.phi_loss],
+                        self.log_vars_inner, self.phi_loss,
+                         self.means_inner_ai,
+                         self.log_vars_inner_ai,
+                         self.phi_ai_loss],
                         feed_dict=feed_dict)
-        
+
         return {"mu_grad":means_gradient,
-                'sigma_grad':vars_gradient, 
-                'phi_loss':phi_loss}
+                'sigma_grad':vars_gradient,
+                'phi_loss':phi_loss,
+                'mu_ai_grad': means_ai_gradient,
+                'sigma_ai_grad': vars_ai_gradient,
+                'phi_ai_loss': phi_ai_loss,
+                }
 
 
     def _init_session(self):
@@ -388,7 +442,7 @@ class Policy(object):
         loss, kl, entropy = 0, 0, 0
 
         # mini batch training
-        self.sess.run(self.phi_train_op, feed_dict)
+        self.sess.run([self.phi_train_op, self.phi_ai_train_op], feed_dict)
         
         if load_policy == 'save':
         
