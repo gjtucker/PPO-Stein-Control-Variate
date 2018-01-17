@@ -43,12 +43,12 @@ class MLP_state_function(object):
             if self.fn_type == 'relu': 
                 layer1 = tf.layers.dense(obs_ph, hid1_size, tf.nn.relu)
                 layer2 = tf.layers.dense(layer1, hid2_size, tf.nn.relu)                
-                layer3 = tf.layers.dense(layer2, 1, tf.nn.relu)
+                layer3 = tf.layers.dense(layer2, 1)
                 out = tf.identity(layer3)
             elif self.fn_type == 'tanh':
                 layer1 = tf.layers.dense(obs_ph, hid1_size, tf.nn.tanh)
                 layer2 = tf.layers.dense(layer1, hid2_size, tf.nn.tanh)                
-                layer3 = tf.layers.dense(layer2, 1, tf.nn.tanh)
+                layer3 = tf.layers.dense(layer2, 1)
                 out = tf.identity(layer3)
 
             phi_value = tf.squeeze(out)
